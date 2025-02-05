@@ -16,11 +16,15 @@
     "url": "https://github.com/GridPlus/eth-lattice-keyring/issues"
   },
   "homepage": "https://github.com/GridPlus/eth-lattice-keyring#readme",
+  "packageManager": "yarn@4.6.0",
+  "engines": {
+    "node": "^18.18 || >=20"
+  },
   "dependencies": {
     "@ethereumjs/tx": "5.4.0",
-    "bn.js": "^5.2.1",
     "@ethereumjs/util": "^9.1.0",
     "@noble/secp256k1": "^2.2.3",
+    "bn.js": "^5.2.1",
     "gridplus-sdk": "^3.3.0",
     "rlp": "^3.0.0"
   }
