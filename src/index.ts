@@ -1,20 +1,88 @@
-const crypto = require('crypto');
-const EventEmitter = require('events').EventEmitter;
-const BN = require('bn.js');
-const SDK = require('gridplus-sdk');
-const EthTx = require('@ethereumjs/tx');
-const { addHexPrefix } = require("@ethereumjs/util");
-const rlp = require('rlp');
+import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import BN from 'bn.js';
+import * as SDK from 'gridplus-sdk';
+import * as EthTx from '@ethereumjs/tx';
+import { addHexPrefix } from '@ethereumjs/util';
+import rlp from 'rlp';
+
+declare const browser: any;
+
 const keyringType = 'Lattice Hardware';
 const HARDENED_OFFSET = 0x80000000;
 const PER_PAGE = 5;
-const CLOSE_CODE = -1000;
 const STANDARD_HD_PATH = `m/44'/60'/0'/0/x`;
 const SDK_TIMEOUT = 120000;
 const CONNECT_TIMEOUT = 20000;
 
+const stripHexPrefix = (hex: string) =>
+  hex.toLowerCase().startsWith('0x') ? hex.slice(2) : hex;
+
+const normalizeHex = (value: unknown): string => {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return stripHexPrefix(value);
+  if (typeof value === 'number') return value.toString(16);
+  if (typeof value === 'bigint') return value.toString(16);
+  if (BN.isBN(value)) return (value as BN).toString(16);
+  if (Buffer.isBuffer(value)) return value.toString('hex');
+  if (value instanceof Uint8Array) return Buffer.from(value).toString('hex');
+  const stringValue = (value as any)?.toString?.();
+  return typeof stringValue === 'string' ? stripHexPrefix(stringValue) : '';
+};
+
+const normalizeVHex = (value: unknown): string => {
+  if (value === null || value === undefined) return '0';
+  if (Buffer.isBuffer(value))
+    return value.length === 0 ? '0' : value.toString('hex');
+  const hex = normalizeHex(value);
+  return hex.length === 0 ? '0' : hex;
+};
+
+const normalizeSigPart = (value: unknown, bytes: number): string =>
+  normalizeHex(value).padStart(bytes * 2, '0');
+
+type KeyringCredentials = {
+  deviceID: string | null;
+  password: string | null;
+  endpoint: string | null;
+};
+
+type AccountOption = {
+  walletUID: string | Buffer | null;
+  hdPath: string;
+};
+
+type DeserializeOptions = {
+  hdPath?: string;
+  creds?: KeyringCredentials;
+  accounts?: string[];
+  accountIndices?: number[];
+  accountOpts?: AccountOption[];
+  walletUID?: string | Buffer | null;
+  name?: string;
+  appName?: string;
+  network?: string | null;
+  page?: number;
+};
+
 class LatticeKeyring extends EventEmitter {
-  constructor (opts={}) {
+  static type = keyringType;
+  type: string;
+  accounts: string[];
+  accountIndices: number[];
+  accountOpts: AccountOption[];
+  isLocked: boolean;
+  creds: KeyringCredentials;
+  walletUID: string | Buffer | null;
+  sdkSession: SDK.Client;
+  page: number;
+  unlockedAccount: number;
+  network: string | null;
+  hdPath: string;
+  appName?: string;
+  name?: string;
+
+  constructor (opts: DeserializeOptions = {}) {
     super()
     this.type = keyringType;
     this._resetDefaults();
@@ -24,7 +92,7 @@ class LatticeKeyring extends EventEmitter {
   //-------------------------------------------------------------------
   // Keyring API (per `https://github.com/MetaMask/eth-simple-keyring`)
   //-------------------------------------------------------------------
-  async deserialize (opts = {}) {
+  async deserialize (opts: DeserializeOptions = {}) {
     if (opts.hdPath)
       this.hdPath = opts.hdPath;
     if (opts.creds)
@@ -100,7 +168,7 @@ class LatticeKeyring extends EventEmitter {
     return "Unlocked";
   }
 
-  // Add addresses to the local store and return the full result
+  // Add addresses to the local store and return only the addresses that were actually added
   async addAccounts(n=1) {
     if (n <= 0) {
       // Avoid non-positive numbers.
@@ -119,6 +187,7 @@ class LatticeKeyring extends EventEmitter {
       throw new Error('No active wallet found in Lattice. Please retry.');
     }
     // Add these indices
+    const newlyAdded = [];
     addrs.forEach((addr, i) => {
       let alreadySaved = false;
       for (let j = 0; j < this.accounts.length; j++) {
@@ -133,10 +202,11 @@ class LatticeKeyring extends EventEmitter {
         this.accountOpts.push({
           walletUID,
           hdPath: this.hdPath,
-        })
+        });
+        newlyAdded.push(addr); // Track what was actually added
       }
-    })
-    return this.accounts;
+    });
+    return newlyAdded; // Return only the addresses that were actually added
   }
 
   // Return the local store of addresses. This gets called when the extension unlocks.
@@ -166,7 +236,14 @@ class LatticeKeyring extends EventEmitter {
     // Build the signing request
     if (fwVersion.major > 0 || fwVersion.minor >= 15) {
       // Newer firmware versions support an easier pathway
-      const data = {
+      const data: {
+        payload: any;
+        curveType: number;
+        hashType: number;
+        encodingType: number;
+        signerPath: number[];
+        decoder?: Buffer;
+      } = {
         // Legacy transactions return tx params. Newer transactions
         // return the raw, serialized transaction
         payload:  tx._type ?
@@ -199,10 +276,10 @@ class LatticeKeyring extends EventEmitter {
     // Construct the `v` signature param
     if (signedTx.sig.v === undefined) {
       // V2 signature needs `v` calculated
-      v = SDK.Utils.getV(tx, signedTx);
+      v = normalizeVHex(SDK.Utils.getV(tx, signedTx));
     } else {
       // Legacy signatures have `v` in the response
-      v = signedTx.sig.v.length === 0 ? '0' : signedTx.sig.v.toString('hex')
+      v = normalizeVHex(signedTx.sig.v);
     }
 
     // Pack the signature into the return object
@@ -255,14 +332,14 @@ class LatticeKeyring extends EventEmitter {
         signerPath: this._getHDPathIndices(addressParentPath, addressIdx),
       },
     };
-    const res = await this.sdkSession.sign(req);
+    const res = await this.sdkSession.sign(req as Parameters<typeof this.sdkSession.sign>[0]);
     if (!res.sig) {
       throw new Error("No signature returned");
     }
     // Convert the `v` to a number. It should convert to 0 or 1
     let v;
     try {
-      v = res.sig.v.toString("hex");
+      v = normalizeVHex(res.sig.v);
       if (v.length < 2) {
         v = `0${v}`;
       }
@@ -279,7 +356,9 @@ class LatticeKeyring extends EventEmitter {
       );
     }
     // Return the sig string
-    return `0x${res.sig.r}${res.sig.s}${v}`;
+    const r = normalizeSigPart(res.sig.r, 32);
+    const s = normalizeSigPart(res.sig.s, 32);
+    return `0x${r}${s}${v}`;
   }
 
   async exportAccount(address) {
@@ -458,11 +537,11 @@ class LatticeKeyring extends EventEmitter {
     return tabs.find((tab) => tab.id === id);
   }
 
-  _getCreds() {
-    return new Promise((resolve, reject) => {
+  _getCreds(): Promise<KeyringCredentials | undefined> {
+    return new Promise<KeyringCredentials | undefined>((resolve, reject) => {
       // We only need to setup if we don't have a deviceID
       if (this._hasCreds())
-        return resolve();
+        return resolve(undefined);
       // If we are not aware of what Lattice we should be talking to,
       // we need to open a window that lets the user go through the
       // pairing or connection process.
@@ -480,7 +559,7 @@ class LatticeKeyring extends EventEmitter {
           // Stop the listener
           clearInterval(listenInterval);
           // Parse and return creds
-          const creds = JSON.parse(event.data);
+          const creds = JSON.parse(event.data) as KeyringCredentials;
           if (!creds.deviceID || !creds.password)
             return reject(new Error('Invalid credentials returned from Lattice.'));
           return resolve(creds);
@@ -568,7 +647,15 @@ class LatticeKeyring extends EventEmitter {
     let url = 'https://signing.gridpl.us';
     if (this.creds.endpoint)
       url = this.creds.endpoint
-    let setupData = {
+    let setupData: {
+      name: string | undefined;
+      baseUrl: string;
+      timeout: number;
+      privKey: Buffer;
+      network: string | null;
+      skipRetryOnWrongWallet: boolean;
+      stateData?: string;
+    } = {
       name: this.appName,
       baseUrl: url,
       timeout: SDK_TIMEOUT,
@@ -763,14 +850,4 @@ function getLegacyTxReq (tx) {
   return txData;
 }
 
-async function httpRequest (url) {
-  const resp = await window.fetch(url);
-  if (resp.ok) {
-    return await resp.text();
-  } else {
-    throw new Error('Failed to make request: ', resp.status);
-  }
-}
-
-LatticeKeyring.type = keyringType
-module.exports = LatticeKeyring;
+export default LatticeKeyring;
